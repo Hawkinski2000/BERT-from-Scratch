@@ -37,8 +37,8 @@ eot = enc._special_tokens['<|endoftext|>'] # End of text token
 enc._special_tokens['<|pad|>'] = eot + 1
 pad = enc._special_tokens['<|pad|>'] # pad token
 
-# tweets = []
-# labels = []
+tweets = []
+labels = []
 
 # Tweets:
 

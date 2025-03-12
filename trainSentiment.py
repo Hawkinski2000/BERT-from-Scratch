@@ -1,7 +1,6 @@
 """"
 Todo:
-    - Set up logging / plotting
-    - dropout? After token embeddings, after attention heads, mlp's, final classifier layer
+    - dropout? After token embeddings, final classifier layer
     - 24 layers?
     - Label smoothing?
 """
@@ -13,7 +12,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-# from hellaswag import render_example, iterate_examples
+import matplotlib.pyplot as plt
 # -----------------------------------------------------------------------------
 
 class SelfAttention(nn.Module):
@@ -26,10 +25,14 @@ class SelfAttention(nn.Module):
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
+        # Dropout
+        self.attn_dropout = nn.Dropout(config.attn_pdrop)  # Dropout after attention
+        self.resid_dropout = nn.Dropout(config.resid_pdrop)  # Dropout after projection
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.is_causal = is_causal
+        
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -43,8 +46,10 @@ class SelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=self.is_causal) # flash attention
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = self.attn_dropout(y) # dropout after attention
         # output projection
         y = self.c_proj(y)
+        y = self.resid_dropout(y) # dropout after projection
         return y
 
 class MLP(nn.Module):
@@ -55,11 +60,15 @@ class MLP(nn.Module):
         self.gelu    = nn.GELU(approximate='tanh')
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.fc_dropout = nn.Dropout(config.mlp_pdrop)
+        self.proj_dropout = nn.Dropout(config.mlp_pdrop)
 
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
+        x = self.fc_dropout(x) # Dropout after activation
         x = self.c_proj(x)
+        x = self.proj_dropout(x) # Dropout after projection
         return x
     
 class EncoderBlock(nn.Module):
@@ -84,6 +93,9 @@ class EncoderConfig:
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
     n_classes: int = 2 # number of sentiment classes
+    attn_pdrop: float = 0.1
+    resid_pdrop: float = 0.1
+    mlp_pdrop: float = 0.1
 
 class BERT(nn.Module):
 
@@ -180,12 +192,6 @@ class DataLoaderLite:
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.split = split
-        # if self.split == "train":
-        #     self.posts_file_path = r"tweets/tweets.pt"
-        #     self.labels_file_path = r"tweets/labels.pt"
-        # elif self.split == "test":
-        #     self.posts_file_path = r"tweets/test_tweets.pt"
-        #     self.labels_file_path = r"tweets/test_labels.pt"
         if self.split == "train":
             self.posts_file_path = r"sentiment140/tweets.pt"
             self.labels_file_path = r"sentiment140/labels.pt"
@@ -224,29 +230,6 @@ class DataLoaderLite:
             self.current_labels_position = self.B * self.process_rank
         
         return encoder_x, y
-
-# -----------------------------------------------------------------------------
-# helper function for HellaSwag eval
-# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
-
-# def get_most_likely_row(tokens, mask, logits):
-#     # evaluate the autoregressive loss at all positions
-#     shift_logits = (logits[..., :-1, :]).contiguous()
-#     shift_tokens = (tokens[..., 1:]).contiguous()
-#     flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-#     flat_shift_tokens = shift_tokens.view(-1)
-#     shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
-#     shift_losses = shift_losses.view(tokens.size(0), -1)
-#     # now get the average loss just for the completion region (where mask == 1), in each row
-#     shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
-#     masked_shift_losses = shift_losses * shift_mask
-#     # sum and divide by the number of 1s in the mask
-#     sum_loss = masked_shift_losses.sum(dim=1)
-#     avg_loss = sum_loss / shift_mask.sum(dim=1)
-#     # now we have a loss for each of the 4 completions
-#     # the one with the lowest loss should be the most likely
-#     pred_norm = avg_loss.argmin().item()
-#     return pred_norm
 
 # -----------------------------------------------------------------------------
 # simple launch:
@@ -343,7 +326,7 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 # Load the checkpoint if it exists, otherwise the model will train from scratch 
-checkpoint_path = "checkpoints/checkpoint_500.pt"
+checkpoint_path = "checkpoints/checkpoint_1000.pt"
 if os.path.exists(checkpoint_path):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
@@ -371,11 +354,11 @@ else:
     print("No checkpoint found. Initializing model from scratch.")
 
 # create the log directory we will write checkpoints to and log to
-# log_dir = "log"
-# os.makedirs(log_dir, exist_ok=True)
-# log_file = os.path.join(log_dir, f"log.txt")
-# with open(log_file, "w") as f: # open for writing to clear the file
-#     pass
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log1.txt")
+with open(log_file, "w") as f: # open for writing to clear the file
+    pass
 
 def generate(tweet=None):
     model.eval()
@@ -422,6 +405,10 @@ def save_checkpoint(model, optimizer, step, checkpoint_dir="checkpoints"):
     print(f"Checkpoint saved at step {step} to {checkpoint_path}")
 
 def train():
+    train_losses = []
+    local_dir = "train_loss"
+    LOSS_DIR = os.path.join(os.path.dirname(__file__), local_dir)
+    os.makedirs(LOSS_DIR, exist_ok=True)
     for step in range(start_step, max_steps):
         t0 = time.time()
         last_step = (step == max_steps - 1)
@@ -449,41 +436,8 @@ def train():
 
             if master_process:
                 print(f"accuracy: {test_accuracy_accum.item():.2%} | validation loss: {test_loss_accum.item():.6f}")
-                # with open(log_file, "a") as f:
-                #     f.write(f"{step} val {test_loss_accum.item():.4f}\n")
-
-        # once in a while evaluate hellaswag
-        # if (step % 250 == 0 or last_step) and (not use_compile):
-        #     num_correct_norm = 0
-        #     num_total = 0
-        #     for i, example in enumerate(iterate_examples("val")):
-        #         # only process examples where i % ddp_world_size == ddp_rank
-        #         if i % ddp_world_size != ddp_rank:
-        #             continue
-        #         # render the example into tokens and labels
-        #         _, tokens, mask, label = render_example(example)
-        #         tokens = tokens.to(device)
-        #         mask = mask.to(device)
-        #         # get the logits
-        #         with torch.no_grad():
-        #             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-        #                 logits, loss = model(tokens)
-        #             pred_norm = get_most_likely_row(tokens, mask, logits)
-        #         num_total += 1
-        #         num_correct_norm += int(pred_norm == label)
-        #     # reduce the stats across all processes
-        #     if ddp:
-        #         num_total = torch.tensor(num_total, dtype=torch.long, device=device)
-        #         num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
-        #         dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
-        #         dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
-        #         num_total = num_total.item()
-        #         num_correct_norm = num_correct_norm.item()
-        #     acc_norm = num_correct_norm / num_total
-        #     if master_process:
-        #         print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
-        #         with open(log_file, "a") as f:
-        #             f.write(f"{step} hella {acc_norm:.4f}\n")
+                with open(log_file, "a") as f:
+                    f.write(f"{step} val {test_loss_accum.item():.4f}\n")
 
         # do one step of the optimization
         model.train()
@@ -520,6 +474,14 @@ def train():
             torch.cuda.synchronize() # wait for the GPU to finish work
         if (master_process and (step > 0 and step % 50 == 0) or last_step):
             save_checkpoint(model, optimizer, step)
+            train_loss_tensor = torch.tensor(train_losses, dtype=torch.long)
+            train_loss_path = os.path.join(LOSS_DIR, "train_loss1.pt")
+            torch.save(train_loss_tensor, train_loss_path)
+            plt.plot(train_losses)
+            plt.xlabel("Steps")
+            plt.ylabel("Train Loss")
+            plt.title("Training Loss")
+            plt.savefig("training_loss_curve2.png")
 
         t1 = time.time()
         dt = t1 - t0 # time difference in seconds
@@ -527,12 +489,9 @@ def train():
         tokens_per_sec = tokens_processed / dt
         if master_process:
             print(f"step {step:5d} | accuracy: {accuracy_accum.item():.2%} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-            # with open(log_file, "a") as f:
-            #     f.write(f"{step} train {loss_accum.item():.6f}\n")
-
-        # once in a while generate from the model (except step 0, which is noise)  
-        # if ((step > 0 and step % 50 == 0) or last_step) and (not use_compile):
-        #     generate("This is awesome")
+            with open(log_file, "a") as f:
+                f.write(f"{step} train {loss_accum.item():.6f}\n")
+            train_losses += [loss_accum.item()]
 
 if mode == "t":
     train()
